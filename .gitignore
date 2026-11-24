@@ -4,3 +4,6 @@ dist/
 credentials/
 *.log
 .DS_Store
+
+# Google Cloud service account downloads
+glassy-emblem-*.json

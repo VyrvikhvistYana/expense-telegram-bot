@@ -1,11 +1,15 @@
 import { Bot } from "grammy";
 import { config } from "./config.js";
 import { parseExpenseFromText } from "./parseExpense.js";
-import { appendExpense, ensureHeaderRow } from "./sheets.js";
+import { addExpenseToMatrix, toSheetDate } from "./sheets.js";
 import { transcribeVoice } from "./voice.js";
-import type { Expense } from "./types.js";
+import { EXPENSE_CATEGORIES, type Expense } from "./types.js";
 
 const bot = new Bot(config.telegramToken);
+
+bot.catch((err) => {
+  console.error("Bot error:", err.error);
+});
 
 function isAllowed(userId: number | undefined): boolean {
   if (!config.allowedUserIds.length) return true;
@@ -13,40 +17,59 @@ function isAllowed(userId: number | undefined): boolean {
   return config.allowedUserIds.includes(userId);
 }
 
-function formatExpense(e: Expense): string {
+function formatExpense(
+  e: Expense,
+  meta?: { sheetDate: string; cell: string; previous: number; next: number },
+): string {
   const note = e.note ? ` — ${e.note}` : "";
-  return `✅ ${e.date} · ${e.amount} ${e.currency} · ${e.category}${note}\nИсточник: ${e.source}`;
+  const lines = [
+    `✅ ${meta?.sheetDate ?? toSheetDate(e.date)} · ${e.amount} ${e.currency} · ${e.category}${note}`,
+    `Источник: ${e.source}`,
+  ];
+  if (meta) {
+    lines.push(`Ячейка ${meta.cell}: ${meta.previous || "пусто"} → ${meta.next}`);
+  }
+  return lines.join("\n");
 }
 
 async function saveFromText(
   text: string,
   source: Expense["source"],
-): Promise<{ ok: true; expense: Expense } | { ok: false; reason: string }> {
+): Promise<
+  | { ok: true; expense: Expense; meta: Awaited<ReturnType<typeof addExpenseToMatrix>> }
+  | { ok: false; reason: string }
+> {
   const expense = await parseExpenseFromText(text, source);
   if (!expense) {
-    return { ok: false, reason: "Не похоже на расход. Пример: «кофе 250» или «такси 400 вчера»." };
+    return {
+      ok: false,
+      reason:
+        "Не похоже на расход. Пример: «кофе 250» или «1 декабря одежда детям 3000».\n" +
+        `Категории: ${EXPENSE_CATEGORIES.join(", ")}`,
+    };
   }
-  await appendExpense(expense);
-  return { ok: true, expense };
+  const meta = await addExpenseToMatrix(expense);
+  return { ok: true, expense, meta };
 }
 
 bot.command("start", async (ctx) => {
+  console.log("incoming /start from", ctx.from?.id);
   if (!isAllowed(ctx.from?.id)) {
     await ctx.reply("Бот приватный. Добавь свой Telegram ID в ALLOWED_USER_IDS.");
     return;
   }
   await ctx.reply(
     [
-      "👋 Expense bot — голос или текст → Google Sheets.",
+      "👋 Expense bot — голос/текст → ячейка в Google Sheets (дата × категория).",
       "",
       "Примеры:",
       "• кофе 250",
-      "• такси 450 вчера",
-      "• продукты 3200 руб",
+      "• 5 декабря подарки 1500",
+      "• кружок ребёнку 2000",
       "",
-      "Или просто пришли голосовое.",
+      "Или голосовое.",
       "",
-      "/help — кратко",
+      "/help — категории",
       "/ping — проверка",
     ].join("\n"),
   );
@@ -55,11 +78,17 @@ bot.command("start", async (ctx) => {
 bot.command("help", async (ctx) => {
   if (!isAllowed(ctx.from?.id)) return;
   await ctx.reply(
-    "Текст или голос с суммой и категорией. Данные пишутся в таблицу Expenses (date, amount, currency, category, note, source).",
+    [
+      "Пишет сумму в твою матрицу: строка даты + колонка категории (прибавляет к уже стоящему числу).",
+      "",
+      "Категории:",
+      ...EXPENSE_CATEGORIES.map((c) => `• ${c}`),
+    ].join("\n"),
   );
 });
 
 bot.command("ping", async (ctx) => {
+  console.log("incoming /ping from", ctx.from?.id);
   if (!isAllowed(ctx.from?.id)) return;
   await ctx.reply("pong");
 });
@@ -69,24 +98,27 @@ bot.on("message:text", async (ctx) => {
   const text = ctx.message.text.trim();
   if (text.startsWith("/")) return;
 
-  await ctx.replyWithChatAction("typing");
+  console.log("incoming text from", ctx.from?.id, text.slice(0, 80));
+  await ctx.reply("⏳ Обрабатываю…");
   try {
-    const result = await saveFromText(text, "text");
+    const result = await saveFromText(text, "текст");
     if (!result.ok) {
       await ctx.reply(result.reason);
       return;
     }
-    await ctx.reply(formatExpense(result.expense));
+    await ctx.reply(formatExpense(result.expense, result.meta));
   } catch (err) {
     console.error(err);
-    await ctx.reply("Ошибка при сохранении. Проверь логи и доступ service account к таблице.");
+    const message = err instanceof Error ? err.message : "Ошибка при сохранении";
+    await ctx.reply(`${message}\nПроверь service account (доступ Редактор) и даты в таблице.`);
   }
 });
 
 bot.on("message:voice", async (ctx) => {
   if (!isAllowed(ctx.from?.id)) return;
 
-  await ctx.replyWithChatAction("typing");
+  console.log("incoming voice from", ctx.from?.id);
+  await ctx.reply("⏳ Слушаю голосовое…");
   try {
     const file = await ctx.getFile();
     if (!file.file_path) {
@@ -104,21 +136,22 @@ bot.on("message:voice", async (ctx) => {
       return;
     }
 
-    const result = await saveFromText(transcript, "voice");
+    const result = await saveFromText(transcript, "голос");
     if (!result.ok) {
       await ctx.reply(`Распознала: «${transcript}»\n\n${result.reason}`);
       return;
     }
-    await ctx.reply(`🎤 «${transcript}»\n\n${formatExpense(result.expense)}`);
+    await ctx.reply(`🎤 «${transcript}»\n\n${formatExpense(result.expense, result.meta)}`);
   } catch (err) {
     console.error(err);
-    await ctx.reply("Ошибка при обработке голоса. Смотри логи сервера.");
+    const message = err instanceof Error ? err.message : "Ошибка при обработке голоса";
+    await ctx.reply(message);
   }
 });
 
 async function main() {
-  await ensureHeaderRow();
-  console.log("Sheets header OK. Starting bot (long polling)…");
+  await bot.api.deleteWebhook({ drop_pending_updates: false });
+  console.log("Starting bot (long polling)… matrix mode → your December sheet");
   await bot.start({
     onStart: (info) => console.log(`Bot @${info.username} is running`),
   });

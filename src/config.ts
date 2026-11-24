@@ -15,7 +15,8 @@ export const config = {
   telegramToken: required("TELEGRAM_BOT_TOKEN"),
   geminiApiKey: required("GEMINI_API_KEY"),
   sheetsId: required("GOOGLE_SHEETS_ID"),
-  sheetTab: process.env.GOOGLE_SHEET_TAB?.trim() || "Expenses",
+  /** Пусто = первый лист таблицы */
+  sheetTab: process.env.GOOGLE_SHEET_TAB?.trim() || "",
   serviceAccountPath:
     process.env.GOOGLE_SERVICE_ACCOUNT_PATH?.trim() || "./credentials/service-account.json",
   allowedUserIds: allowedRaw
